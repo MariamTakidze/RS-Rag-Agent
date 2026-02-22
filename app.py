@@ -1,8 +1,6 @@
 import streamlit as st
 import os
 from langchain_groq import ChatGroq
-from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.prompts import PromptTemplate
 from langchain_core.documents import Document
@@ -20,7 +18,7 @@ except Exception:
     st.stop()
 
 # ========================
-# 1. ფაილებიდან წაკითხვა (TXT + PDF)
+# 1. ფაილებიდან წაკითხვა
 # ========================
 def load_documents_from_folder(folder_path: str = "docs") -> list[Document]:
     documents = []
@@ -29,30 +27,33 @@ def load_documents_from_folder(folder_path: str = "docs") -> list[Document]:
         st.error(f"საქაღალდე '{folder_path}' არ მოიძებნა!")
         st.stop()
 
-    files = [f for f in os.listdir(folder_path) if f.endswith(".txt") or f.endswith(".pdf")]
+    # მხოლოდ .txt და .pdf — requirements.txt და სხვა სერვის ფაილები იგნორირდება
+    files = [
+        f for f in os.listdir(folder_path)
+        if (f.endswith(".txt") or f.endswith(".pdf"))
+        and f != "requirements.txt"
+        and not f.startswith(".")
+    ]
 
     if not files:
-        st.error("docs/ საქაღალდეში .txt ან .pdf ფაილები არ არის!")
+        st.error("docs/ საქაღალდეში დოკუმენტები არ არის!")
         st.stop()
 
     for filename in sorted(files):
         filepath = os.path.join(folder_path, filename)
-
         try:
             if filename.endswith(".txt"):
                 with open(filepath, "r", encoding="utf-8") as f:
                     content = f.read().strip()
-
             elif filename.endswith(".pdf"):
                 try:
                     from pypdf import PdfReader
                     reader = PdfReader(filepath)
                     content = "\n\n".join(
-                        page.extract_text() for page in reader.pages
-                        if page.extract_text()
+                        p.extract_text() for p in reader.pages if p.extract_text()
                     ).strip()
                 except ImportError:
-                    st.warning(f"⚠️ {filename}: pypdf არ არის დაინსტალირებული. გამოიყენე .txt ფაილები.")
+                    st.warning(f"⚠️ {filename}: pypdf საჭიროა PDF-ისთვის")
                     continue
 
             if content:
@@ -60,55 +61,75 @@ def load_documents_from_folder(folder_path: str = "docs") -> list[Document]:
                     page_content=content,
                     metadata={"source": filename}
                 ))
-
         except Exception as e:
-            st.warning(f"⚠️ {filename} ვერ წაიკითხა: {e}")
+            st.warning(f"⚠️ {filename}: {e}")
 
     return documents
 
 # ========================
-# 2. RAG სისტემა
+# 2. BM25-სტილის keyword retriever ქართულისთვის
+# ========================
+def keyword_retrieve(query: str, documents: list[Document], top_k: int = 2) -> list[Document]:
+    """
+    ქართული ტექსტისთვის keyword-based retrieval.
+    FAISS embedding-ზე უკეთ მუშაობს ქართულ ენაზე.
+    """
+    query_words = set(query.lower().split())
+    # მოკლე სიტყვები გამოვრიცხოთ
+    query_words = {w for w in query_words if len(w) > 2}
+
+    scored = []
+    for doc in documents:
+        content_lower = doc.page_content.lower()
+        score = sum(1 for w in query_words if w in content_lower)
+        # ასევე ვამოწმებთ source ფაილის სახელს
+        source_lower = doc.metadata["source"].lower()
+        score += sum(0.5 for w in query_words if w in source_lower)
+        scored.append((score, doc))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    # მხოლოდ შესაბამისი დოკუმენტები (score > 0)
+    matched = [(s, d) for s, d in scored if s > 0]
+
+    if not matched:
+        # თუ არაფერი ემთხვევა — პირველი top_k დოკუმენტი
+        return [d for _, d in scored[:top_k]]
+
+    return [d for _, d in matched[:top_k]]
+
+# ========================
+# 3. Chunking + Retrieval
 # ========================
 @st.cache_resource
-def setup_rag(_api_key: str):
+def setup_chunks() -> list[Document]:
     raw_docs = load_documents_from_folder("docs")
-
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
-        chunk_overlap=50,
+        chunk_size=600,
+        chunk_overlap=60,
         separators=["\n\n", "\n", ".", " "]
     )
-    split_docs = splitter.split_documents(raw_docs)
+    return splitter.split_documents(raw_docs), raw_docs
 
-    embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-    )
-
-    vectorstore = FAISS.from_documents(split_docs, embeddings)
-
-    retriever = vectorstore.as_retriever(
-        search_type="mmr",
-        search_kwargs={"k": 3, "fetch_k": 10}
-    )
-
-    llm = ChatGroq(
+@st.cache_resource
+def get_llm(_api_key: str):
+    return ChatGroq(
         api_key=_api_key,
         model_name="llama-3.3-70b-versatile",
         temperature=0,
         max_tokens=1024,
     )
 
-    return retriever, llm, len(split_docs), len(raw_docs)
-
 # ========================
-# 3. პასუხის გენერაცია
+# 4. პასუხის გენერაცია
 # ========================
-def get_answer(query: str, retriever, llm) -> tuple[str, list[Document]]:
-    retrieved_docs = retriever.invoke(query)
+def get_answer(query: str, chunks: list[Document], llm) -> tuple[str, list[Document]]:
+    # Keyword retrieval chunk-ებზე
+    retrieved = keyword_retrieve(query, chunks, top_k=3)
 
     context = "\n\n---\n\n".join(
         f"[წყარო: {d.metadata['source']}]\n{d.page_content}"
-        for d in retrieved_docs
+        for d in retrieved
     )
 
     prompt = PromptTemplate.from_template(
@@ -117,30 +138,31 @@ def get_answer(query: str, retriever, llm) -> tuple[str, list[Document]]:
         "თუ კონტექსტში პასუხი არ არის, თქვი: 'ამ კითხვაზე ინფორმაცია ბაზაში არ მოიპოვება.'\n\n"
         "კონტექსტი:\n{context}\n\n"
         "კითხვა: {question}\n\n"
-        "პასუხი (ბოლოში მიუთითე წყარო და: "
+        "პასუხი (ბოლოში მიუთითე: წყარო: [ფაილის სახელი] და "
         "პასუხი მომზადებულია RS InfoHub-ის მიხედვით - https://infohub.rs.ge/ka):"
     )
 
     chain = prompt | llm | StrOutputParser()
     answer = chain.invoke({"context": context, "question": query})
-    return answer, retrieved_docs
+    return answer, retrieved
 
 # ========================
-# 4. UI
+# 5. UI
 # ========================
 st.title("🇬🇪 RS InfoHub — RAG აგენტი")
 st.caption("საგადასახადო და საბაჟო კითხვებზე პასუხი docs/ საქაღალდის დოკუმენტების საფუძველზე")
 
 with st.spinner("დოკუმენტები იტვირთება..."):
-    retriever, llm, chunk_count, doc_count = setup_rag(GROQ_API_KEY)
+    chunks, raw_docs = setup_chunks()
+    llm = get_llm(GROQ_API_KEY)
 
-st.success(f"✅ {doc_count} დოკუმენტი ჩაიტვირთა → {chunk_count} chunk-ად დაიყო")
+st.success(f"✅ {len(raw_docs)} დოკუმენტი ჩაიტვირთა → {len(chunks)} chunk-ად დაიყო")
 
 with st.expander("📂 ჩატვირთული დოკუმენტები"):
     docs_folder = "docs"
     if os.path.exists(docs_folder):
         for f in sorted(os.listdir(docs_folder)):
-            if f.endswith((".txt", ".pdf")):
+            if (f.endswith(".txt") or f.endswith(".pdf")) and f != "requirements.txt":
                 size = os.path.getsize(os.path.join(docs_folder, f))
                 icon = "📄" if f.endswith(".txt") else "📕"
                 st.markdown(f"- {icon} `{f}` — {size:,} byte")
@@ -164,7 +186,7 @@ if user_query:
     with st.chat_message("assistant"):
         try:
             with st.spinner("პასუხი იძებნება..."):
-                answer, source_docs = get_answer(user_query, retriever, llm)
+                answer, source_docs = get_answer(user_query, chunks, llm)
 
             st.markdown(answer)
 
