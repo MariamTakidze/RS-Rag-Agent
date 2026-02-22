@@ -212,7 +212,7 @@ if user_query:
                 with st.expander("🔍 გამოყენებული Chunk-ები"):
                     for i, doc in enumerate(source_docs, 1):
                         st.markdown(f"**Chunk {i} — {doc.metadata['source']}**")
-                        st.caption(doc.page_content[:400] + ("..." if len(doc.page_content) > 400 else ""))
+                        st.caption(doc.page_content[:800] + ("..." if len(doc.page_content) > 800 else ""))
 
         except Exception as e:
             st.error(f"შეცდომა: {str(e)}")
